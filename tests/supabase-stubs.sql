@@ -7,7 +7,12 @@ create role authenticated nologin noinherit;
 create role service_role nologin noinherit bypassrls;
 
 create schema auth;
-create table auth.users (id uuid primary key, email text);
+create table auth.users (
+  id uuid primary key,
+  email text,
+  email_confirmed_at timestamptz,
+  raw_user_meta_data jsonb not null default '{}'
+);
 
 -- Same lookup order as Supabase's auth.uid().
 create function auth.uid()

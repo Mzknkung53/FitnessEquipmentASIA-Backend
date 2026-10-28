@@ -19,7 +19,7 @@ Design document (Thai, with ER diagram and access matrix): [`docs/database-desig
 | --- | --- |
 | `supabase/migrations/` | Schema, in order: foundation → catalog → inventory → sales → RLS → API (views + functions) → storage |
 | `supabase/seed.sql` | Demo data from the frontend's sample products and stock (local, or once in a fresh project before launch) |
-| `tests/database.test.sql` | ~65 checks: RLS per role, form functions, VAT, stock state machine. Runs in a transaction and rolls back |
+| `tests/database.test.sql` | ~80 checks: RLS per role, form functions, VAT, staff sign-in rules, stock state machine. Runs in a transaction and rolls back |
 | `tests/supabase-stubs.sql` | Stand-ins for Supabase's `auth`/`storage` schemas and roles, for plain Postgres only |
 | `scripts/verify-local.sh` | Throwaway Postgres → stubs → migrations → seed → tests, no Docker needed |
 
@@ -62,8 +62,19 @@ supabase db push     # migrations only; seed.sql is never pushed
 For a first look with demo data, run `supabase/seed.sql` once in the dashboard's SQL Editor.
 Without the CLI you can also paste each file of `supabase/migrations/` into the SQL Editor, in name order.
 
-Then create staff: invite the user in Authentication → Users, and insert a row in
-`staff_profiles` (`user_id`, `display_name`, `role`). An auth account without that row has no staff access.
+### Staff accounts (Google sign-in)
+
+Staff sign in with Google. An account gets staff rights only when its email is **confirmed**
+and listed in `private.staff_allowlist`; the allowlist creates the `staff_profiles` row once,
+at that person's next sign-in. After that the row is managed directly:
+
+```sql
+insert into private.staff_allowlist (email, role, display_name) values ('name@example.com', 'sales', 'Name');
+update public.staff_profiles set is_active = false where user_id = '<uuid>';   -- disable
+update public.staff_profiles set role = 'warehouse' where user_id = '<uuid>';  -- change role
+```
+
+Only Google is used, so turn off the Email provider in Authentication → Sign In / Providers.
 
 The secret key bypasses RLS: keep it server-side (the frontend reads it only in server code).
 

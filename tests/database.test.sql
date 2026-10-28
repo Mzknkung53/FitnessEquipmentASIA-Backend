@@ -283,5 +283,64 @@ select pg_temp.ok((select cost_thb from public.variant_internal where sku = 'FEA
 select pg_temp.ok((select count(*) from public.staff_profiles) = 4, 'admin reads all staff');
 reset role;
 
+-- ---------------------------------------------------------------------------
+-- Google login profiles and the staff allowlist
+-- ---------------------------------------------------------------------------
+
+insert into private.staff_allowlist (email, role, display_name)
+values ('new-sales@test', 'sales', 'New Sales');
+
+-- Email/password sign-up with an allowlisted address, not yet confirmed.
+insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data)
+values ('00000000-0000-0000-0000-0000000000b1', 'New-Sales@test', null, '{"full_name": "Someone"}');
+select pg_temp.ok(
+  exists (select 1 from public.customer_profiles where user_id = '00000000-0000-0000-0000-0000000000b1'),
+  'sign-up creates a customer profile');
+select pg_temp.ok(
+  not exists (select 1 from public.staff_profiles where user_id = '00000000-0000-0000-0000-0000000000b1'),
+  'unconfirmed email gets no staff rights, even if allowlisted');
+
+select pg_temp.as_user('authenticated', '00000000-0000-0000-0000-0000000000b1');
+select pg_temp.ok((public.ensure_auth_profiles() ->> 'is_staff')::boolean = false,
+  'ensure_auth_profiles cannot grant staff to an unconfirmed email');
+reset role;
+
+-- The address gets confirmed later.
+update auth.users set email_confirmed_at = now() where id = '00000000-0000-0000-0000-0000000000b1';
+select pg_temp.ok(
+  (select role = 'sales' and is_active from public.staff_profiles where user_id = '00000000-0000-0000-0000-0000000000b1'),
+  'confirming the email grants the allowlisted role');
+
+-- Google sign-in: confirmed on insert.
+insert into auth.users (id, email, email_confirmed_at)
+values ('00000000-0000-0000-0000-0000000000b2', 'chatchye3@gmail.com', now());
+select pg_temp.ok(
+  (select role = 'admin' from public.staff_profiles where user_id = '00000000-0000-0000-0000-0000000000b2'),
+  'confirmed allowlisted Google account becomes staff');
+
+-- Admin disables and demotes; the next page view must not undo it.
+update public.staff_profiles set is_active = false where user_id = '00000000-0000-0000-0000-0000000000b1';
+update public.staff_profiles set role = 'warehouse' where user_id = '00000000-0000-0000-0000-0000000000b2';
+select pg_temp.as_user('authenticated', '00000000-0000-0000-0000-0000000000b1');
+select pg_temp.ok((public.ensure_auth_profiles() ->> 'is_staff')::boolean = false,
+  'disabled staff stays disabled after ensure_auth_profiles');
+reset role;
+select pg_temp.as_user('authenticated', '00000000-0000-0000-0000-0000000000b2');
+select pg_temp.ok((public.ensure_auth_profiles() ->> 'role') = 'warehouse',
+  'role changed by an admin is not reset by the allowlist');
+reset role;
+
+select pg_temp.as_user('anon');
+select pg_temp.fails($$select public.ensure_auth_profiles()$$,
+  'permission denied for function%', 'anon cannot call ensure_auth_profiles');
+select pg_temp.fails($$select private.sync_auth_profiles('00000000-0000-0000-0000-0000000000b1')$$,
+  'permission denied for function%', 'anon cannot call the private sync helper');
+reset role;
+select pg_temp.as_user('authenticated', '00000000-0000-0000-0000-0000000000a5');
+select pg_temp.fails($$select private.sync_auth_profiles('00000000-0000-0000-0000-0000000000b2')$$,
+  'permission denied for function%', 'signed-in users cannot call the private sync helper');
+select pg_temp.ok((select count(*) from public.customer_profiles) = 1, 'customers only see their own profile');
+reset role;
+
 \echo 'All database tests passed.'
 rollback;
