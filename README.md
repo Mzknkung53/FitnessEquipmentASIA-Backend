@@ -1,0 +1,76 @@
+# Fitness Equipment Asia — Backend
+
+Database (Supabase / PostgreSQL) for the Fitness Equipment Asia storefront. The API
+server that sits between the frontend and Supabase is not written yet; this repo
+currently holds the schema, security rules and database functions it will call.
+
+Design document (Thai, with ER diagram and access matrix): [`docs/database-design.md`](docs/database-design.md)
+
+## Layout
+
+| Path | What |
+| --- | --- |
+| `supabase/migrations/` | Schema, in order: foundation → catalog → inventory → sales → RLS → API (views + functions) → storage |
+| `supabase/seed.sql` | Demo data from the frontend's sample products and stock (local only) |
+| `tests/database.test.sql` | ~70 checks: RLS per role, form functions, stock state machine. Runs in a transaction and rolls back |
+| `tests/supabase-stubs.sql` | Stand-ins for Supabase's `auth`/`storage` schemas and roles, for plain Postgres only |
+| `scripts/verify-local.sh` | Throwaway Postgres → stubs → migrations → seed → tests, no Docker needed |
+
+## Run locally
+
+With the [Supabase CLI](https://supabase.com/docs/guides/local-development) and Docker:
+
+```bash
+supabase init        # once; creates supabase/config.toml, keeps the migrations
+```
+
+```bash
+supabase start
+```
+
+```bash
+supabase db reset    # applies migrations + seed.sql
+```
+
+```bash
+psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f tests/database.test.sql
+```
+
+Without Docker (needs Postgres 15+ binaries):
+
+```bash
+scripts/verify-local.sh
+```
+
+## Deploy to a Supabase project
+
+```bash
+supabase link --project-ref <project-ref>
+```
+
+```bash
+supabase db push     # migrations only; seed.sql is never pushed
+```
+
+Then create staff: invite the user in Authentication → Users, and insert a row in
+`staff_profiles` (`user_id`, `display_name`, `role`). An auth account without that row has no staff access.
+
+Copy `.env.example` to `.env` for the API server. The secret key bypasses RLS: keep it server-side.
+
+## How the backend talks to the database
+
+- **Public forms** (quote, checkout, repair): backend validates and rate-limits, then calls
+  `submit_quote_request`, `place_order`, `submit_service_request`, `register_attachment` with the
+  secret key. These functions are not callable with the publishable key.
+- **Staff actions**: backend forwards the staff user's JWT, so RLS applies and `auth.uid()` is
+  recorded, e.g. `stock_apply_action('U-000201', 'receive')`.
+- **Catalog**: read `products_public` (safe with the publishable key, so the frontend may also read it directly).
+
+Validation errors use SQLSTATE `22023` with a short code (`missing:city`, `unknown_sku:…`) → HTTP 400;
+`forbidden` (`42501`) → HTTP 403.
+
+Generate TypeScript types for the API server once a database is running:
+
+```bash
+supabase gen types typescript --local > src/database.types.ts
+```
