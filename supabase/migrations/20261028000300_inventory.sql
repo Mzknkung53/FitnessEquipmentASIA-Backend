@@ -17,7 +17,7 @@ create table public.stock_units (
   location_id text not null references public.locations (id),
   condition text,
   state public.unit_state not null default 'inbound',
-  order_id uuid,                                      -- set while reserved / after dispatch (FK added with orders)
+  quote_id uuid,                                      -- set while reserved / after dispatch (FK added with quotes)
   received_at date,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -38,7 +38,7 @@ create table public.stock_movements (
   to_state public.unit_state not null,
   from_location_id text references public.locations (id),
   to_location_id text not null references public.locations (id),
-  order_id uuid,
+  quote_id uuid,
   note text,
   actor uuid not null references auth.users (id),
   created_at timestamptz not null default now()

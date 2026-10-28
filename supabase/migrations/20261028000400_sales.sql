@@ -1,6 +1,7 @@
--- Sales: customers, quote requests, orders, payments, service requests and
--- their file attachments. Customers have no login; the backend writes these
--- rows through the submit_* / place_order functions, staff work them after.
+-- Sales: customers, quote requests, service requests and their file attachments.
+-- The website is a catalog + quotation tool for now: there is no online ordering
+-- or payment. Customers have no login; the backend writes these rows through the
+-- submit_* functions and staff work them after.
 
 create table public.customers (
   id uuid primary key default gen_random_uuid(),
@@ -17,7 +18,7 @@ create table public.customers (
   updated_at timestamptz not null default now()
 );
 
--- One customer per contact handle, so repeat buyers line up across quotes and orders.
+-- One customer per contact handle, so repeat customers line up across quote requests.
 create unique index customers_contact_idx on public.customers (contact_method, lower(contact_value));
 
 create trigger customers_updated_at
@@ -50,7 +51,15 @@ create table public.quote_requests (
   message text,
   status public.quote_status not null default 'new',
   assigned_to uuid references auth.users (id),
-  quoted_total_thb numeric(14, 2) check (quoted_total_thb >= 0),
+  -- Quotation amounts. Catalog prices exclude VAT, so VAT is added here.
+  quoted_total_thb numeric(14, 2) check (quoted_total_thb >= 0),           -- excl. VAT
+  vat_rate numeric(5, 2) not null default 7 check (vat_rate between 0 and 100),
+  quoted_vat_thb numeric(14, 2) generated always as (
+    round(quoted_total_thb * vat_rate / 100, 2)
+  ) stored,
+  quoted_grand_total_thb numeric(14, 2) generated always as (
+    quoted_total_thb + round(quoted_total_thb * vat_rate / 100, 2)
+  ) stored,
   quoted_at timestamptz,
   closed_at timestamptz,                             -- won / lost / cancelled
   lost_reason text,
@@ -73,94 +82,15 @@ create table public.quote_items (
   qty int not null check (qty between 1 and 9999),
   note text,
   list_price_thb numeric(12, 2),                     -- web price when requested (null = quote only)
-  quoted_unit_price_thb numeric(12, 2) check (quoted_unit_price_thb >= 0),
+  quoted_unit_price_thb numeric(12, 2) check (quoted_unit_price_thb >= 0),   -- excl. VAT
+  unit_cost_thb numeric(12, 2),                      -- cost snapshot when requested, for margin
   unique (quote_id, sku)
 );
 
--- ---------------------------------------------------------------------------
--- Orders (direct checkout: fixed price + ready stock only)
--- ---------------------------------------------------------------------------
-
-create table public.orders (
-  id uuid primary key default gen_random_uuid(),
-  reference text unique not null,                   -- SO-2026-00001
-  customer_id uuid not null references public.customers (id),
-  quote_id uuid references public.quote_requests (id),   -- when converted from a quote
-  contact_name text not null,
-  phone text not null,
-  email text,
-  country text not null,
-  city text not null,
-  postcode text,
-  address text,                                      -- required for delivery, see check below
-  fulfilment public.fulfilment_method not null,
-  payment_option public.payment_option not null,
-  status public.order_status not null default 'pending_confirmation',
-  display_currency char(3) not null default 'THB',
-  fx_thb_per_unit numeric(12, 6),                    -- rate snapshot when display_currency <> THB
-  subtotal_thb numeric(14, 2) not null check (subtotal_thb >= 0),
-  shipping_thb numeric(14, 2) check (shipping_thb >= 0),          -- null until staff confirm
-  installation_thb numeric(14, 2) check (installation_thb >= 0),
-  discount_thb numeric(14, 2) not null default 0 check (discount_thb >= 0),
-  vat_thb numeric(14, 2) check (vat_thb >= 0),
-  total_thb numeric(14, 2) generated always as (
-    subtotal_thb + coalesce(shipping_thb, 0) + coalesce(installation_thb, 0)
-    - discount_thb + coalesce(vat_thb, 0)
-  ) stored,
-  assigned_to uuid references auth.users (id),
-  confirmed_at timestamptz,
-  cancelled_at timestamptz,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  check (fulfilment = 'pickup' or address is not null),
-  check (display_currency = 'THB' or fx_thb_per_unit is not null)
-);
-
-create index orders_status_idx on public.orders (status, created_at desc);
-create index orders_customer_idx on public.orders (customer_id);
-
-create trigger orders_updated_at
-  before update on public.orders
-  for each row execute function private.set_updated_at();
-
-create table public.order_items (
-  id bigint generated always as identity primary key,
-  order_id uuid not null references public.orders (id) on delete cascade,
-  sku text not null references public.variants (sku),
-  qty int not null check (qty between 1 and 9999),
-  unit_price_thb numeric(12, 2) not null check (unit_price_thb > 0),   -- price snapshot
-  unit_cost_thb numeric(12, 2),                                         -- cost snapshot, for margin
-  line_total_thb numeric(14, 2) generated always as (qty * unit_price_thb) stored,
-  unique (order_id, sku)
-);
-
 alter table public.stock_units
-  add constraint stock_units_order_fk foreign key (order_id) references public.orders (id);
+  add constraint stock_units_quote_fk foreign key (quote_id) references public.quote_requests (id);
 alter table public.stock_movements
-  add constraint stock_movements_order_fk foreign key (order_id) references public.orders (id);
-
-create table public.payments (
-  id uuid primary key default gen_random_uuid(),
-  order_id uuid not null references public.orders (id),
-  method text not null check (method in ('bank_transfer', 'card', 'promptpay', 'cash', 'other')),
-  amount_thb numeric(14, 2) not null check (amount_thb > 0),
-  status public.payment_status not null default 'pending',
-  provider text,                                     -- payment gateway, once one is chosen
-  provider_ref text,
-  slip_path text,                                    -- transfer slip in bucket payment-slips
-  paid_at timestamptz,
-  confirmed_by uuid references auth.users (id),
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-
-create unique index payments_provider_ref_idx on public.payments (provider, provider_ref)
-  where provider_ref is not null;
-create index payments_order_idx on public.payments (order_id);
-
-create trigger payments_updated_at
-  before update on public.payments
-  for each row execute function private.set_updated_at();
+  add constraint stock_movements_quote_fk foreign key (quote_id) references public.quote_requests (id);
 
 -- ---------------------------------------------------------------------------
 -- Service / repair requests

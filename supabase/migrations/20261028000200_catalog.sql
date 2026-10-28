@@ -71,7 +71,7 @@ create table public.variants (
   label text not null,
   swatch text check (swatch ~ '^#[0-9a-fA-F]{6}$'),
   stock_status public.stock_status not null default 'import',
-  price_thb numeric(12, 2) check (price_thb > 0),   -- null = quote only, never 0
+  price_thb numeric(12, 2) check (price_thb > 0),   -- excl. VAT; null = quote only, never 0
   lead_time text,                                    -- shown only when staff supply it
   sort int not null default 0,
   is_active boolean not null default true,

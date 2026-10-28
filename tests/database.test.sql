@@ -99,8 +99,8 @@ select pg_temp.fails($$insert into public.quote_requests (reference) values ('x'
   'permission denied%', 'anon cannot insert quotes directly');
 select pg_temp.fails($$select public.submit_quote_request('{}')$$,
   'permission denied for function%', 'anon cannot call submit_quote_request');
-select pg_temp.fails($$select * from public.sales_monthly$$,
-  'permission denied%', 'anon cannot read sales_monthly');
+select pg_temp.fails($$select * from public.won_quotes_monthly$$,
+  'permission denied%', 'anon cannot read won_quotes_monthly');
 
 reset role;
 
@@ -139,14 +139,19 @@ select pg_temp.ok(
 
 select public.submit_quote_request($${"contact_name": "สมชาย", "contact_method": "line",
   "contact_value": "somchaigym", "country": "ไทย", "city": "เชียงใหม่", "items": [{"sku": "FEA-T900-BLK", "qty": 1}]}$$);
-select pg_temp.ok((select count(*) from public.customers) = 1, 'same LINE ID (any case) maps to one customer');
+select pg_temp.ok((select count(*) from public.customers where contact_method = 'line') = 1, 'same LINE ID (any case) maps to one customer');
 
 select pg_temp.fails($$select public.submit_quote_request('{"contact_method":"line","contact_value":"a","country":"TH","city":"x","items":[{"sku":"FEA-T900-BLK","qty":1}]}')$$,
   'missing:contact_name', 'quote requires a contact name');
 select pg_temp.fails($$select public.submit_quote_request('{"contact_name":"a","contact_method":"fax","contact_value":"a","country":"TH","city":"x","items":[{"sku":"FEA-T900-BLK","qty":1}]}')$$,
   'invalid:contact_method', 'quote rejects unknown contact methods');
-select pg_temp.fails($$select public.submit_quote_request('{"contact_name":"a","contact_method":"line","contact_value":"a","country":"TH","city":"x","items":[]}')$$,
-  'missing:items', 'quote needs at least one item');
+select set_config('test.advice', public.submit_quote_request(
+  '{"contact_name":"a","contact_method":"email","contact_value":"a@b.co","country":"TH","city":"x","items":[]}')::text, true);
+select pg_temp.ok(
+  (select count(*) from public.quote_items where quote_id = (current_setting('test.advice')::jsonb ->> 'id')::uuid) = 0,
+  'advice-only quote request (no items) is accepted');
+select pg_temp.fails($$select public.submit_quote_request('{"contact_name":"a","contact_method":"line","contact_value":"a","country":"TH","city":"x","items":{"sku":"x"}}')$$,
+  'invalid:items', 'quote items must be a list');
 select pg_temp.fails($$select public.submit_quote_request('{"contact_name":"a","contact_method":"line","contact_value":"a","country":"TH","city":"x","items":[{"sku":"FEA-DRAFT-1","qty":1}]}')$$,
   'unknown_sku:FEA-DRAFT-1', 'quote rejects SKUs of unpublished products');
 select pg_temp.fails($$select public.submit_quote_request('{"contact_name":"a","contact_method":"line","contact_value":"a","country":"TH","city":"x","items":[{"sku":"FEA-T900-BLK","qty":0}]}')$$,
@@ -154,28 +159,12 @@ select pg_temp.fails($$select public.submit_quote_request('{"contact_name":"a","
 select pg_temp.fails($$select public.submit_quote_request('{"contact_name":"a","contact_method":"line","contact_value":"a","country":"TH","city":"x","items":[{"sku":"FEA-T900-BLK"}]}')$$,
   'invalid:qty', 'quote rejects a missing qty');
 
-select pg_temp.fails($$select public.place_order('{"contact_name":"a","phone":"081","country":"TH","city":"x","fulfilment":"pickup","payment_option":"bank_transfer","items":[{"sku":"FEA-PL01-CUS","qty":1}]}')$$,
-  'item_not_purchasable:FEA-PL01-CUS', 'checkout rejects quote-only SKUs');
-select pg_temp.fails($$select public.place_order('{"contact_name":"a","phone":"081","country":"TH","city":"x","fulfilment":"pickup","payment_option":"bank_transfer","items":[{"sku":"FEA-PL01-BLK","qty":1}]}')$$,
-  'item_not_purchasable:FEA-PL01-BLK', 'checkout rejects preorder SKUs');
-select pg_temp.fails($$select public.place_order('{"contact_name":"a","phone":"081","country":"TH","city":"x","fulfilment":"delivery","payment_option":"card","items":[{"sku":"FEA-T900-BLK","qty":1}]}')$$,
-  'missing:address', 'delivery needs an address');
-
-select set_config('test.order1', public.place_order($${
-  "contact_name": "ร้านยิม", "phone": "0810000000", "country": "ไทย", "city": "ลำพูน",
-  "address": "1 ถนนตัวอย่าง", "fulfilment": "delivery", "payment_option": "deposit", "currency": "USD",
-  "items": [{"sku": "FEA-PL01-SLV", "qty": 2, "price_thb": 1}, {"sku": "FEA-FL50-15", "qty": 10}]
-}$$)::text, true);
-
-select pg_temp.ok((current_setting('test.order1')::jsonb ->> 'subtotal_thb')::numeric = 186900,
-  'order subtotal uses database prices (client price ignored)');
 select pg_temp.ok(
-  (select fx_thb_per_unit = 36 and shipping_thb is null and status = 'pending_confirmation'
-   from public.orders where id = (current_setting('test.order1')::jsonb ->> 'id')::uuid),
-  'order snapshots the USD rate and waits for shipping confirmation');
-select pg_temp.ok(
-  (select unit_cost_thb from public.order_items where order_id = (current_setting('test.order1')::jsonb ->> 'id')::uuid and sku = 'FEA-PL01-SLV') = 55180,
-  'order line snapshots unit cost');
+  (select unit_cost_thb from public.quote_items where quote_id = (current_setting('test.quote1')::jsonb ->> 'id')::uuid and sku = 'FEA-PL01-SLV') = 55180,
+  'quote line snapshots unit cost for margin analysis');
+select pg_temp.ok(not exists (
+  select 1 from information_schema.routines where routine_schema = 'public' and routine_name = 'place_order'),
+  'no online ordering function exists (catalog + quotation only)');
 
 select set_config('test.sr1', public.submit_service_request(
   '{"product_model":"fea-pl01","unit_code":"u-000184","symptom":"เสียงดัง","contact_value":"LINE: abc"}')::text, true);
@@ -207,9 +196,9 @@ select pg_temp.fails($$select public.stock_apply_action('U-000201', 'receive')$$
 select pg_temp.ok((select state from public.stock_apply_action('U-000201', 'move', 'SHOWROOM-PL')) = 'showroom', 'moving into the showroom makes it a showroom unit');
 select pg_temp.ok((select state from public.stock_apply_action('U-000201', 'move', 'WH-A-02-14')) = 'available', 'moving out of the showroom makes it available');
 select pg_temp.ok(
-  (select state = 'reserved' and order_id = (current_setting('test.order1')::jsonb ->> 'id')::uuid
-   from public.stock_apply_action('U-000184', 'reserve', null, (current_setting('test.order1')::jsonb ->> 'id')::uuid, 'SO')),
-  'reserve links the order');
+  (select state = 'reserved' and quote_id = (current_setting('test.quote1')::jsonb ->> 'id')::uuid
+   from public.stock_apply_action('U-000184', 'reserve', null, (current_setting('test.quote1')::jsonb ->> 'id')::uuid, 'Q')),
+  'reserve links the quote');
 select pg_temp.ok((select state from public.stock_apply_action('U-000184', 'dispatch')) = 'dispatched', 'dispatch a reserved unit');
 select pg_temp.fails($$select public.stock_apply_action('U-000184', 'move', 'SHOWROOM-PL')$$,
   'invalid_transition:dispatched:move', 'dispatched units cannot be moved');
@@ -241,7 +230,7 @@ select pg_temp.as_user('authenticated', '00000000-0000-0000-0000-0000000000a2');
 
 select pg_temp.fails($$select public.stock_apply_action('U-000185', 'release')$$,
   'forbidden', 'sales cannot move stock');
-select pg_temp.ok((select count(*) from public.quote_requests) = 2, 'sales reads quote requests');
+select pg_temp.ok((select count(*) from public.quote_requests) = 3, 'sales reads quote requests');
 select pg_temp.ok((select count(*) from public.variant_internal) > 0, 'sales reads costs');
 select pg_temp.ok(exists (select 1 from public.products where slug = 'draft-machine'), 'staff see draft products');
 update public.variants set price_thb = 92000 where sku = 'FEA-PL01-SLV';
@@ -251,8 +240,18 @@ select pg_temp.ok(
   'price change is recorded with who changed it');
 update public.variant_internal set cost_thb = 1 where sku = 'FEA-PL01-SLV';
 select pg_temp.ok((select cost_thb from public.variant_internal where sku = 'FEA-PL01-SLV') = 55180, 'only admin edits costs');
-select pg_temp.ok((select revenue_thb from public.sales_monthly) = 186900, 'sales_monthly sums order revenue');
-select pg_temp.ok((select requests from public.quote_funnel_monthly) = 2, 'quote_funnel_monthly counts requests');
+update public.quote_items set quoted_unit_price_thb = 85000 where quote_id = (current_setting('test.quote1')::jsonb ->> 'id')::uuid and sku = 'FEA-PL01-SLV';
+update public.quote_items set quoted_unit_price_thb = 70000, unit_cost_thb = 40000 where quote_id = (current_setting('test.quote1')::jsonb ->> 'id')::uuid and sku = 'FEA-PL03-STD';
+update public.quote_requests set quoted_total_thb = 535000, quoted_at = now(), status = 'won', closed_at = now()
+  where id = (current_setting('test.quote1')::jsonb ->> 'id')::uuid;
+select pg_temp.ok(
+  (select quoted_vat_thb = 37450 and quoted_grand_total_thb = 572450 from public.quote_requests
+   where id = (current_setting('test.quote1')::jsonb ->> 'id')::uuid),
+  'quotation adds 7% VAT on top of the ex-VAT total');
+select pg_temp.ok(
+  (select revenue_thb = 535000 and cost_thb = 325540 and gross_profit_thb = 209460 from public.won_quotes_monthly),
+  'won_quotes_monthly computes revenue, cost and gross profit');
+select pg_temp.ok((select requests = 3 and won = 1 and win_rate = 1 from public.quote_funnel_monthly), 'quote_funnel_monthly counts requests and win rate');
 select pg_temp.fails($$insert into public.staff_profiles (user_id, display_name, role) values ('00000000-0000-0000-0000-0000000000a5', 'x', 'admin')$$,
   'new row violates row-level security policy%', 'sales cannot create staff accounts');
 

@@ -1,6 +1,7 @@
 -- DEMO seed for local development (`supabase db reset` runs this file).
 -- Generated from the frontend's src/lib/data/sample-products.ts and sample-stock.ts.
--- Names, prices and specs are placeholders: do NOT run this against production.
+-- Names, prices and specs are placeholders. Fine for local work or a fresh project
+-- before launch; never run it on a project that already holds real data.
 
 insert into public.categories (id, name_th, name_en, sort) values
   ('plate-loaded', 'เครื่องใส่แผ่นน้ำหนัก', 'Plate-Loaded', 10),

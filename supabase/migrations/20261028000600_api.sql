@@ -4,18 +4,18 @@
 --   products_public          storefront catalog, safe for anon
 --   current_exchange_rates   latest THB rate per currency
 --   variant_stock_summary    unit counts per SKU and state (staff)
---   sales_monthly            revenue, cost and gross margin per month (sales/admin)
+--   won_quotes_monthly       won quotation value, cost and gross margin per month (sales/admin)
 --   quote_funnel_monthly     quote volume, win rate, response time (sales/admin)
 --
 -- Write functions:
---   submit_quote_request, place_order, submit_service_request, register_attachment
+--   submit_quote_request, submit_service_request, register_attachment
 --       -> service_role only. The backend validates, rate-limits, then calls these.
 --   stock_register_unit, stock_apply_action
 --       -> signed-in staff. The backend forwards the staff user's JWT so auth.uid()
 --          is recorded as the actor.
 --
 -- Validation errors raise SQLSTATE 22023 with a short machine-readable message
--- (e.g. 'item_not_purchasable:FEA-PL03-STD'); the backend maps them to HTTP 400.
+-- (e.g. 'unknown_sku:FEA-X'); the backend maps them to HTTP 400.
 
 -- ---------------------------------------------------------------------------
 -- Read models
@@ -94,20 +94,23 @@ from public.variants v
 left join public.stock_units u on u.sku = v.sku
 group by v.sku, v.stock_status;
 
-create view public.sales_monthly
+-- Amounts exclude VAT. Revenue uses the quoted unit prices staff entered on the
+-- lines; cost uses the snapshot taken when the request arrived.
+create view public.won_quotes_monthly
 with (security_invoker = true)
 as
 select
-  date_trunc('month', o.created_at at time zone 'Asia/Bangkok')::date as month,
-  count(distinct o.id) as orders,
-  sum(i.line_total_thb) as revenue_thb,
+  date_trunc('month', q.closed_at at time zone 'Asia/Bangkok')::date as month,
+  count(distinct q.id) as won_quotes,
+  sum(i.qty * i.quoted_unit_price_thb) as revenue_thb,
   sum(i.qty * i.unit_cost_thb) as cost_thb,
-  sum(i.line_total_thb) - sum(i.qty * i.unit_cost_thb) as gross_profit_thb,
-  round((sum(i.line_total_thb) - sum(i.qty * i.unit_cost_thb)) / nullif(sum(i.line_total_thb), 0), 4) as gross_margin,
-  count(*) filter (where i.unit_cost_thb is null) as lines_missing_cost
-from public.orders o
-join public.order_items i on i.order_id = o.id
-where o.status <> 'cancelled'
+  sum(i.qty * i.quoted_unit_price_thb) - sum(i.qty * i.unit_cost_thb) as gross_profit_thb,
+  round((sum(i.qty * i.quoted_unit_price_thb) - sum(i.qty * i.unit_cost_thb))
+        / nullif(sum(i.qty * i.quoted_unit_price_thb), 0), 4) as gross_margin,
+  count(*) filter (where i.unit_cost_thb is null or i.quoted_unit_price_thb is null) as lines_missing_data
+from public.quote_requests q
+join public.quote_items i on i.quote_id = q.id
+where q.status = 'won' and q.closed_at is not null
 group by 1;
 
 create view public.quote_funnel_monthly
@@ -126,7 +129,7 @@ select
 from public.quote_requests q
 group by 1;
 
-revoke all on public.sales_monthly, public.quote_funnel_monthly from anon;
+revoke all on public.won_quotes_monthly, public.quote_funnel_monthly from anon;
 
 -- ---------------------------------------------------------------------------
 -- Private helpers for the write functions
@@ -206,8 +209,9 @@ end;
 $$;
 
 -- Payload items -> one row per SKU (duplicates summed), validated against the public catalog.
+-- No items is allowed: "ขอคำแนะนำจัดชุดยิม" sends a request without products.
 create function private.read_items(p jsonb)
-returns table (sku text, qty int, note text, price_thb numeric, stock_status public.stock_status)
+returns table (sku text, qty int, note text, price_thb numeric, cost_thb numeric)
 language plpgsql
 stable
 security definer
@@ -216,9 +220,11 @@ as $$
 declare
   v_missing text;
 begin
-  if jsonb_typeof(p -> 'items') is distinct from 'array'
-     or jsonb_array_length(p -> 'items') = 0 then
-    perform private.bad_input('missing:items');
+  if p -> 'items' is null or jsonb_typeof(p -> 'items') = 'null' then
+    return;
+  end if;
+  if jsonb_typeof(p -> 'items') <> 'array' then
+    perform private.bad_input('invalid:items');
   end if;
   if jsonb_array_length(p -> 'items') > 100 then
     perform private.bad_input('too_many:items');
@@ -246,10 +252,11 @@ begin
   return query
   select v.sku, least(sum((e ->> 'qty')::int), 9999)::int,
          nullif(left(string_agg(btrim(e ->> 'note'), ' / '), 500), ''),
-         v.price_thb, v.stock_status
+         v.price_thb, vi.cost_thb
   from jsonb_array_elements(p -> 'items') e
   join public.variants v on v.sku = e ->> 'sku'
-  group by v.sku, v.price_thb, v.stock_status;
+  left join public.variant_internal vi on vi.sku = v.sku
+  group by v.sku, v.price_thb, vi.cost_thb;
 end;
 $$;
 
@@ -264,7 +271,7 @@ $$;
     installation?: 'yes'|'no'|'unsure',
     access?: { upper_floor, lift, stairs, truck_access },
     target_date?: 'YYYY-MM-DD', budget?, message?, source?,
-    items: [{ sku, qty, note? }]
+    items?: [{ sku, qty, note? }]   -- may be empty for an advice-only request
   }
 */
 create function public.submit_quote_request(payload jsonb)
@@ -320,100 +327,14 @@ begin
     coalesce(private.opt_text(payload, 'source', 40), 'web'))
   returning id into v_quote;
 
-  insert into public.quote_items (quote_id, sku, qty, note, list_price_thb)
-  select v_quote, i.sku, i.qty, i.note, i.price_thb
+  insert into public.quote_items (quote_id, sku, qty, note, list_price_thb, unit_cost_thb)
+  select v_quote, i.sku, i.qty, i.note, i.price_thb, i.cost_thb
   from private.read_items(payload) i;
 
   return jsonb_build_object('id', v_quote, 'reference', v_ref);
 exception
   when invalid_text_representation or invalid_datetime_format or datetime_field_overflow then
     raise exception 'invalid:payload' using errcode = '22023';
-end;
-$$;
-
-/*
-  place_order(payload) -> { id, reference, subtotal_thb }
-  Direct checkout. Only SKUs with a fixed price and stock_status 'ready'.
-  Prices come from the database, never from the client.
-  payload: {
-    contact_name, phone, email?, country, city, postcode?, address?,
-    fulfilment: 'delivery'|'pickup', payment_option: 'bank_transfer'|'card'|'deposit',
-    currency?: 'THB'|'USD', items: [{ sku, qty }]
-  }
-*/
-create function public.place_order(payload jsonb)
-returns jsonb
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-  v_name text := private.req_text(payload, 'contact_name', 120);
-  v_phone text := private.req_text(payload, 'phone', 40);
-  v_email text := private.opt_text(payload, 'email', 160);
-  v_country text := private.req_text(payload, 'country', 80);
-  v_city text := private.req_text(payload, 'city', 120);
-  v_address text := private.opt_text(payload, 'address', 1000);
-  v_fulfilment public.fulfilment_method;
-  v_payment public.payment_option;
-  v_currency text := upper(coalesce(nullif(payload ->> 'currency', ''), 'THB'));
-  v_rate numeric;
-  v_bad text;
-  v_customer uuid;
-  v_order uuid;
-  v_ref text;
-  v_subtotal numeric;
-begin
-  begin
-    v_fulfilment := (payload ->> 'fulfilment')::public.fulfilment_method;
-    v_payment := (payload ->> 'payment_option')::public.payment_option;
-  exception when invalid_text_representation then
-    perform private.bad_input('invalid:fulfilment_or_payment');
-  end;
-  if v_fulfilment is null or v_payment is null then
-    perform private.bad_input('missing:fulfilment_or_payment');
-  end if;
-  if v_fulfilment = 'delivery' and v_address is null then
-    perform private.bad_input('missing:address');
-  end if;
-
-  if v_currency <> 'THB' then
-    select r.thb_per_unit into v_rate from public.current_exchange_rates r where r.currency = v_currency;
-    if v_rate is null then
-      perform private.bad_input('unsupported:currency');
-    end if;
-  end if;
-
-  select i.sku into v_bad from private.read_items(payload) i
-  where i.price_thb is null or i.stock_status <> 'ready'
-  limit 1;
-  if found then
-    perform private.bad_input('item_not_purchasable:' || v_bad);
-  end if;
-
-  select sum(i.qty * i.price_thb) into v_subtotal from private.read_items(payload) i;
-
-  v_customer := private.upsert_customer(
-    v_name, null, 'phone', v_phone, v_email, v_phone, v_country, v_city);
-  v_ref := private.next_reference('SO');
-
-  insert into public.orders (
-    reference, customer_id, contact_name, phone, email, country, city, postcode, address,
-    fulfilment, payment_option, display_currency, fx_thb_per_unit, subtotal_thb,
-    shipping_thb)
-  values (
-    v_ref, v_customer, v_name, v_phone, v_email, v_country, v_city,
-    private.opt_text(payload, 'postcode', 20), v_address,
-    v_fulfilment, v_payment, v_currency, v_rate, v_subtotal,
-    case when v_fulfilment = 'pickup' then 0 end)
-  returning id into v_order;
-
-  insert into public.order_items (order_id, sku, qty, unit_price_thb, unit_cost_thb)
-  select v_order, i.sku, i.qty, i.price_thb, vi.cost_thb
-  from private.read_items(payload) i
-  left join public.variant_internal vi on vi.sku = i.sku;
-
-  return jsonb_build_object('id', v_order, 'reference', v_ref, 'subtotal_thb', v_subtotal);
 end;
 $$;
 
@@ -511,13 +432,13 @@ end;
 $$;
 
 /*
-  stock_apply_action(unit_code, action, location_id?, order_id?, note?)
+  stock_apply_action(unit_code, action, location_id?, quote_id?, note?)
 
   action    allowed from                    to
   receive   inbound                         available
   move      any but dispatched              same state, new location*
-  reserve   available, showroom             reserved   (order_id optional)
-  release   reserved                        available  (clears order_id)
+  reserve   available, showroom             reserved   (quote_id optional)
+  release   reserved                        available  (clears quote_id)
   dispatch  available, reserved             dispatched
   service   any                             service    (returns, repairs, quarantine)
   restock   service                         available
@@ -527,7 +448,7 @@ $$;
 */
 create function public.stock_apply_action(
   p_unit_code text, p_action public.stock_action,
-  p_location_id text default null, p_order_id uuid default null, p_note text default null)
+  p_location_id text default null, p_quote_id uuid default null, p_note text default null)
 returns public.stock_units
 language plpgsql
 security definer
@@ -576,19 +497,19 @@ begin
   end if;
 
   insert into public.stock_movements (
-    unit_code, action, from_state, to_state, from_location_id, to_location_id, order_id, note, actor)
+    unit_code, action, from_state, to_state, from_location_id, to_location_id, quote_id, note, actor)
   values (
     v_unit.unit_code, p_action, v_unit.state, v_to_state, v_unit.location_id, v_to_location,
-    coalesce(p_order_id, v_unit.order_id), p_note, auth.uid());
+    coalesce(p_quote_id, v_unit.quote_id), p_note, auth.uid());
 
   update public.stock_units
   set state = v_to_state,
       location_id = v_to_location,
       received_at = case when p_action = 'receive' then (now() at time zone 'Asia/Bangkok')::date else received_at end,
-      order_id = case
+      quote_id = case
         when p_action = 'release' then null
-        when p_action in ('reserve', 'dispatch') then coalesce(p_order_id, order_id)
-        else order_id
+        when p_action in ('reserve', 'dispatch') then coalesce(p_quote_id, quote_id)
+        else quote_id
       end
   where unit_code = v_unit.unit_code
   returning * into v_unit;
@@ -604,7 +525,6 @@ $$;
 
 revoke execute on function
   public.submit_quote_request(jsonb),
-  public.place_order(jsonb),
   public.submit_service_request(jsonb),
   public.register_attachment(text, text, text, text, bigint),
   public.stock_register_unit(text, text, text, text, text, text),
@@ -617,7 +537,6 @@ grant execute on function private.is_staff() to anon, authenticated;
 
 grant execute on function
   public.submit_quote_request(jsonb),
-  public.place_order(jsonb),
   public.submit_service_request(jsonb),
   public.register_attachment(text, text, text, text, bigint)
 to service_role;

@@ -3,7 +3,7 @@
 -- Conventions used in every migration:
 --   * Business tables live in `public` (exposed by the Supabase Data API) with RLS on.
 --   * Helpers that must never be called over the API live in `private`.
---   * Money is numeric(12,2) in THB. A null price means "quote only" and is never 0.
+--   * Money is numeric(12,2) in THB, excluding VAT. A null price means "quote only" and is never 0.
 --   * security definer functions always pin `search_path = ''` and fully qualify names.
 
 create schema if not exists private;
@@ -24,18 +24,6 @@ create type public.contact_method as enum ('line', 'wechat', 'whatsapp', 'phone'
 create type public.installation_choice as enum ('yes', 'no', 'unsure');
 
 create type public.quote_status as enum ('new', 'reviewing', 'quoted', 'won', 'lost', 'cancelled');
-create type public.order_status as enum (
-  'pending_confirmation',  -- team confirms shipping / installation cost first
-  'awaiting_payment',
-  'paid',
-  'preparing',
-  'shipped',
-  'completed',
-  'cancelled'
-);
-create type public.fulfilment_method as enum ('delivery', 'pickup');
-create type public.payment_option as enum ('bank_transfer', 'card', 'deposit');
-create type public.payment_status as enum ('pending', 'confirmed', 'failed', 'refunded');
 create type public.service_status as enum ('new', 'scheduled', 'in_progress', 'resolved', 'closed');
 
 -- ---------------------------------------------------------------------------

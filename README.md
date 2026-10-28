@@ -1,8 +1,15 @@
 # Fitness Equipment Asia — Backend
 
-Database (Supabase / PostgreSQL) for the Fitness Equipment Asia storefront. The API
-server that sits between the frontend and Supabase is not written yet; this repo
-currently holds the schema, security rules and database functions it will call.
+Database (Supabase / PostgreSQL) for the Fitness Equipment Asia website: schema,
+security rules and the database functions the site calls.
+
+Scope for now: **product catalog + quotation requests + repair requests**. There is no
+online ordering or payment; staff send quotations and handle payment outside the site.
+All prices are stored **excluding VAT**; quotations add VAT (`vat_rate`, default 7%).
+
+The frontend's server side (Next.js Server Actions) currently plays the backend role:
+it holds the keys and calls the functions below. A separate API server can take that
+over later without changing the database.
 
 Design document (Thai, with ER diagram and access matrix): [`docs/database-design.md`](docs/database-design.md)
 
@@ -11,8 +18,8 @@ Design document (Thai, with ER diagram and access matrix): [`docs/database-desig
 | Path | What |
 | --- | --- |
 | `supabase/migrations/` | Schema, in order: foundation → catalog → inventory → sales → RLS → API (views + functions) → storage |
-| `supabase/seed.sql` | Demo data from the frontend's sample products and stock (local only) |
-| `tests/database.test.sql` | ~70 checks: RLS per role, form functions, stock state machine. Runs in a transaction and rolls back |
+| `supabase/seed.sql` | Demo data from the frontend's sample products and stock (local, or once in a fresh project before launch) |
+| `tests/database.test.sql` | ~65 checks: RLS per role, form functions, VAT, stock state machine. Runs in a transaction and rolls back |
 | `tests/supabase-stubs.sql` | Stand-ins for Supabase's `auth`/`storage` schemas and roles, for plain Postgres only |
 | `scripts/verify-local.sh` | Throwaway Postgres → stubs → migrations → seed → tests, no Docker needed |
 
@@ -52,17 +59,20 @@ supabase link --project-ref <project-ref>
 supabase db push     # migrations only; seed.sql is never pushed
 ```
 
+For a first look with demo data, run `supabase/seed.sql` once in the dashboard's SQL Editor.
+Without the CLI you can also paste each file of `supabase/migrations/` into the SQL Editor, in name order.
+
 Then create staff: invite the user in Authentication → Users, and insert a row in
 `staff_profiles` (`user_id`, `display_name`, `role`). An auth account without that row has no staff access.
 
-Copy `.env.example` to `.env` for the API server. The secret key bypasses RLS: keep it server-side.
+The secret key bypasses RLS: keep it server-side (the frontend reads it only in server code).
 
-## How the backend talks to the database
+## How the server talks to the database
 
-- **Public forms** (quote, checkout, repair): backend validates and rate-limits, then calls
-  `submit_quote_request`, `place_order`, `submit_service_request`, `register_attachment` with the
-  secret key. These functions are not callable with the publishable key.
-- **Staff actions**: backend forwards the staff user's JWT, so RLS applies and `auth.uid()` is
+- **Public forms** (quote, repair): server code validates, then calls `submit_quote_request`,
+  `submit_service_request`, `register_attachment` with the secret key. These functions are not
+  callable with the publishable key.
+- **Staff actions** (later, once staff login exists): the server forwards the staff user's JWT, so RLS applies and `auth.uid()` is
   recorded, e.g. `stock_apply_action('U-000201', 'receive')`.
 - **Catalog**: read `products_public` (safe with the publishable key, so the frontend may also read it directly).
 

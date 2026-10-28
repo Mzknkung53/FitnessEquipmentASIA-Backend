@@ -4,7 +4,7 @@
 --
 -- Who can do what (admin passes every check):
 --   anon / any visitor : published catalog, exchange rates
---   sales              : catalog edits, costs (read), customers, quotes, orders, payments, service
+--   sales              : catalog edits, costs (read), customers, quotes, service
 --   warehouse          : locations, stock (through stock_* functions), catalog read incl. drafts
 --   service            : service requests, stock read
 --   admin              : everything, incl. cost edits and staff management
@@ -23,9 +23,6 @@ alter table public.stock_movements enable row level security;
 alter table public.customers enable row level security;
 alter table public.quote_requests enable row level security;
 alter table public.quote_items enable row level security;
-alter table public.orders enable row level security;
-alter table public.order_items enable row level security;
-alter table public.payments enable row level security;
 alter table public.service_requests enable row level security;
 alter table public.attachments enable row level security;
 
@@ -141,25 +138,6 @@ create policy "sales price quote items" on public.quote_items
   using ((select private.has_role('sales')))
   with check ((select private.has_role('sales')));
 
-create policy "staff read orders" on public.orders
-  for select to authenticated using ((select private.has_role('sales', 'warehouse')));
-create policy "sales update orders" on public.orders
-  for update to authenticated
-  using ((select private.has_role('sales')))
-  with check ((select private.has_role('sales')));
-
-create policy "staff read order items" on public.order_items
-  for select to authenticated using ((select private.has_role('sales', 'warehouse')));
-
-create policy "sales read payments" on public.payments
-  for select to authenticated using ((select private.has_role('sales')));
-create policy "sales record payments" on public.payments
-  for insert to authenticated with check ((select private.has_role('sales')));
-create policy "sales confirm payments" on public.payments
-  for update to authenticated
-  using ((select private.has_role('sales')))
-  with check ((select private.has_role('sales')));
-
 create policy "service desk reads requests" on public.service_requests
   for select to authenticated using ((select private.has_role('sales', 'service')));
 create policy "service desk updates requests" on public.service_requests
@@ -169,10 +147,6 @@ create policy "service desk updates requests" on public.service_requests
 
 create policy "staff read attachments" on public.attachments
   for select to authenticated using ((select private.has_role('sales', 'service')));
-
--- Known trade-off: warehouse can read order_items, including the unit_cost_thb
--- snapshot, so it can pick and pack. If cost must be hidden from warehouse, give
--- them a pick-list view without that column and drop 'warehouse' above.
 
 -- Belt and braces on top of RLS: the anonymous role gets no write privileges at all.
 revoke insert, update, delete, truncate on all tables in schema public from anon;
