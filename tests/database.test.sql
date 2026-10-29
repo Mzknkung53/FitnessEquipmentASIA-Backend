@@ -342,5 +342,87 @@ select pg_temp.fails($$select private.sync_auth_profiles('00000000-0000-0000-000
 select pg_temp.ok((select count(*) from public.customer_profiles) = 1, 'customers only see their own profile');
 reset role;
 
+-- ---------------------------------------------------------------------------
+-- Staff quotation workflow
+-- ---------------------------------------------------------------------------
+
+select pg_temp.as_user('service_role');
+select set_config('test.q', public.submit_quote_request($${
+  "contact_name": "ฟิตเนสทดสอบ", "contact_method": "phone", "contact_value": "0899999999",
+  "country": "ไทย", "city": "เชียงราย",
+  "items": [{"sku": "FEA-T900-BLK", "qty": 2}, {"sku": "FEA-PL03-STD", "qty": 1}]
+}$$) ->> 'id', true);
+reset role;
+
+select pg_temp.as_user('anon');
+select pg_temp.fails($$select public.save_quotation(current_setting('test.q')::uuid, '[]', 7)$$,
+  'permission denied for function%', 'anon cannot price a quote');
+select pg_temp.fails($$select * from public.quote_overview$$, 'permission denied%', 'anon cannot read quote_overview');
+reset role;
+
+select pg_temp.as_user('authenticated', '00000000-0000-0000-0000-0000000000a1');
+select pg_temp.ok((public.staff_inbox_counts() ->> 'new_quotes')::int = 0, 'warehouse sees no quote badge');
+select pg_temp.ok((select count(*) from public.quote_overview) = 0, 'warehouse cannot list quotes');
+select pg_temp.fails($$select public.save_quotation(current_setting('test.q')::uuid, '[]', 7)$$,
+  'forbidden', 'warehouse cannot price a quote');
+reset role;
+
+select pg_temp.as_user('authenticated', '00000000-0000-0000-0000-0000000000a2');
+select pg_temp.ok((public.staff_inbox_counts() ->> 'new_quotes')::int >= 1, 'sales sees the new-quote badge');
+select pg_temp.ok(
+  (select item_count = 2 and total_qty = 3 and unpriced_items = 1 and list_total_thb = 99800 and attachment_count = 0
+   from public.quote_overview where id = current_setting('test.q')::uuid),
+  'quote_overview summarises lines, quantities and web prices');
+select pg_temp.ok(
+  (select count(*) = 2 and bool_and(name_th is not null) from public.quote_item_detail where quote_id = current_setting('test.q')::uuid),
+  'quote_item_detail joins product names');
+
+select public.set_quote_status(current_setting('test.q')::uuid, 'reviewing');
+select pg_temp.ok(
+  (select status = 'reviewing' and assigned_to = '00000000-0000-0000-0000-0000000000a2' from public.quote_requests where id = current_setting('test.q')::uuid),
+  'taking a quote assigns it to the staff member');
+
+select set_config('test.l1', (select id::text from public.quote_items where quote_id = current_setting('test.q')::uuid and sku = 'FEA-T900-BLK'), true);
+select set_config('test.l2', (select id::text from public.quote_items where quote_id = current_setting('test.q')::uuid and sku = 'FEA-PL03-STD'), true);
+
+select pg_temp.fails(format($$select public.save_quotation(%L, '[{"id": %s, "price": 45000}]', 7)$$, current_setting('test.q'), current_setting('test.l1')),
+  'missing:price:FEA-PL03-STD', 'every line needs a price');
+select pg_temp.fails(format($$select public.save_quotation(%L, '[{"id": %s, "price": -5}]', 7)$$, current_setting('test.q'), current_setting('test.l1')),
+  'invalid:price', 'negative prices are rejected');
+select pg_temp.fails(format($$select public.save_quotation(%L, '[]', 150)$$, current_setting('test.q')),
+  'invalid:vat_rate', 'VAT rate must be 0-100');
+
+select pg_temp.ok(
+  (select (r ->> 'quoted_total_thb')::numeric = 170000 and (r ->> 'quoted_vat_thb')::numeric = 11900 and (r ->> 'quoted_grand_total_thb')::numeric = 181900
+   from (select public.save_quotation(current_setting('test.q')::uuid,
+     format('[{"id": %s, "price": 45000}, {"id": %s, "price": 80000}]', current_setting('test.l1'), current_setting('test.l2'))::jsonb, 7) as r) x),
+  'save_quotation totals the lines and adds 7% VAT');
+select pg_temp.ok((select status = 'quoted' and quoted_at is not null from public.quote_requests where id = current_setting('test.q')::uuid),
+  'priced quote is marked quoted');
+select pg_temp.fails($$select public.set_quote_status(current_setting('test.q')::uuid, 'quoted')$$,
+  'invalid_transition:quoted:quoted', 'quoted cannot be set by hand');
+
+select public.set_quote_status(current_setting('test.q')::uuid, 'won');
+select pg_temp.ok((select status = 'won' and closed_at is not null from public.quote_requests where id = current_setting('test.q')::uuid),
+  'won closes the quote');
+select pg_temp.fails($$select public.save_quotation(current_setting('test.q')::uuid, '[]', 7)$$,
+  'quote_closed', 'a closed quote cannot be re-priced');
+select public.set_quote_status(current_setting('test.q')::uuid, 'reviewing');
+select pg_temp.ok((select status = 'reviewing' and closed_at is null from public.quote_requests where id = current_setting('test.q')::uuid),
+  'reopening clears closed_at');
+select public.set_quote_status(current_setting('test.q')::uuid, 'lost', '  ราคาสูงกว่าคู่แข่ง  ');
+select pg_temp.ok((select status = 'lost' and lost_reason = 'ราคาสูงกว่าคู่แข่ง' from public.quote_requests where id = current_setting('test.q')::uuid),
+  'lost keeps a trimmed reason');
+select pg_temp.fails($$select public.set_quote_status(current_setting('test.q')::uuid, 'won')$$,
+  'invalid_transition:lost:won', 'won only from quoted');
+
+-- Advice-only request (no lines), export customer: VAT 0.
+select pg_temp.fails($$select public.save_quotation((current_setting('test.advice')::jsonb ->> 'id')::uuid, '[]', 0)$$,
+  'missing:total', 'a request without lines needs a total');
+select pg_temp.ok(
+  ((public.save_quotation((current_setting('test.advice')::jsonb ->> 'id')::uuid, '[]', 0, 250000)) ->> 'quoted_grand_total_thb')::numeric = 250000,
+  'advice-only quote takes a manual total; VAT 0 for export');
+reset role;
+
 \echo 'All database tests passed.'
 rollback;
