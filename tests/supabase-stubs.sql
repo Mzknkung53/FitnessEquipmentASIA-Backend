@@ -41,9 +41,13 @@ create table storage.objects (
   id uuid primary key default gen_random_uuid(),
   bucket_id text references storage.buckets (id),
   name text,
-  owner uuid
+  owner uuid,
+  size bigint
 );
 alter table storage.objects enable row level security;
+grant usage on schema storage to anon, authenticated, service_role;
+grant select on storage.buckets to anon, authenticated, service_role;
+grant all on storage.objects to anon, authenticated, service_role;
 
 -- Supabase's default grants on the public schema.
 grant usage on schema public to anon, authenticated, service_role;
